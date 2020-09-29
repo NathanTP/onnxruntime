@@ -20,6 +20,48 @@ using namespace onnxruntime::common;
 using namespace ONNX_NAMESPACE;
 namespace onnxruntime {
 
+// NP XXX
+class timer {
+  public:
+    timer() {
+      name = "";
+    }
+
+    timer(const char *in_name) {
+      name = in_name;
+    }
+
+    void start() {
+      startTime = std::chrono::high_resolution_clock::now();
+    }
+
+    void stop() {
+      totalTime += (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+    }
+
+    void reset() {
+      totalTime = 0;
+    }
+
+    int64_t report(void) {
+      return totalTime;
+    }
+
+    void print(const char *extra = "") {
+      stop();
+      printf("%s:%s -> %jdus\n", name, extra, totalTime);
+      reset();
+    }
+   
+    private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
+
+    // Total time in microseconds
+    int64_t totalTime = 0;
+    const char *name;
+};
+
+
 std::ostream& operator<<(std::ostream& out, AllocKind alloc_kind) {
   switch (alloc_kind) {
     case AllocKind::kAllocate:
@@ -751,30 +793,44 @@ class PlannerImpl {
   }
 };  // namespace onnxruntime
 
+
 Status PlannerImpl::CreatePlan() {
+  auto prof = timer("CreatePlan");
   auto& p_graph_nodes = graph_viewer_.GetNodesInTopologicalOrder();
 
   int num_ml_values = ort_value_name_idx_map_.MaxIdx() + 1;
 
+  prof.start();
   Initialize(p_graph_nodes.size(), static_cast<size_t>(num_ml_values));
+  prof.print("Initialize");
 
+  prof.start();
   // Determine execution order: we use the default topological sort order for now. We can later
   // explore more efficient orderings (from a memory usage perspective).
   for (auto n : p_graph_nodes) {
     plan_.execution_plan.emplace_back(n);
   }
+  prof.print("execution order");
 
+  prof.start();
   // compute use counts for all ml-values
   ORT_RETURN_IF_ERROR(ComputeUseCounts());
+  prof.print("use counts");
 
+  prof.start();
   // determine sharing/reuse among ml-values
   ORT_RETURN_IF_ERROR(ComputeReusePlan());
+  prof.print("reuse plan");
 
+  prof.start();
   // Determine nodes that need fence check. This needs to be done after ComputeUseCounts and ComputeReusePlan.
   ORT_RETURN_IF_ERROR(ComputeFenceCheck());
+  prof.print("fence check");
 
+  prof.start();
   // convert information in the freelist_ into a deallocation plan in required format
   GenerateDeallocationPlan();
+  prof.print("deallocation plan");
 
   return Status::OK();
 }

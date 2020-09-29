@@ -977,12 +977,57 @@ static bool ModelHasFP16Inputs(const Graph& graph) {
   return false;
 }
 
+// NP XXX
+class timer {
+  public:
+    timer() {
+      name = "";
+    }
+
+    timer(const char *in_name) {
+      name = in_name;
+    }
+
+    void start() {
+      startTime = std::chrono::high_resolution_clock::now();
+    }
+
+    void stop() {
+      totalTime += (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+    }
+
+    void reset() {
+      totalTime = 0;
+    }
+
+    int64_t report(void) {
+      return totalTime;
+    }
+
+    void print(const char *extra = "") {
+      stop();
+      printf("%s:%s -> %jdus\n", name, extra, totalTime);
+      reset();
+    }
+   
+    private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
+
+    // Total time in microseconds
+    int64_t totalTime = 0;
+    const char *name;
+};
+
 common::Status InferenceSession::Initialize() {
   Status status = Status::OK();
   TimePoint tp;
   if (session_profiler_.IsEnabled()) {
     tp = session_profiler_.StartTime();
   }
+
+  timer e2e = timer();
+  e2e.start();
+  timer prof = timer();
 
   ORT_TRY {
     LOGS(*session_logger_, INFO) << "Initializing session.";
@@ -991,6 +1036,7 @@ common::Status InferenceSession::Initialize() {
 
     bool have_cpu_ep = false;
 
+    prof.start();
     {
       std::lock_guard<onnxruntime::OrtMutex> initial_guard(session_mutex_);
 
@@ -1015,10 +1061,12 @@ common::Status InferenceSession::Initialize() {
       auto p_cpu_exec_provider = onnxruntime::make_unique<CPUExecutionProvider>(epi);
       ORT_RETURN_IF_ERROR_SESSIONID_(RegisterExecutionProvider(std::move(p_cpu_exec_provider)));
     }
+    prof.print("get execution providers");
 
     // re-acquire mutex
     std::lock_guard<onnxruntime::OrtMutex> l(session_mutex_);
 
+    prof.start();
     // At this time we know all the providers that will be part of this session.
     // Read shared allocators from the environment and update them in the respective providers.
     //
@@ -1036,12 +1084,14 @@ common::Status InferenceSession::Initialize() {
     if (use_env_allocators == "1") {
       UpdateProvidersWithSharedAllocators();
     }
+    prof.print("allocators");
 
 #ifdef ONNXRUNTIME_ENABLE_INSTRUMENT
     TraceLoggingWriteStart(session_activity, "OrtInferenceSessionActivity");
     session_activity_started_ = true;
 #endif
 
+    prof.start();
     // now that we have all the execution providers, create the session state
     session_state_ = onnxruntime::make_unique<SessionState>(
         model_->MainGraph(),
@@ -1053,9 +1103,13 @@ common::Status InferenceSession::Initialize() {
         *session_logger_,
         session_profiler_,
         session_options_.use_deterministic_compute);
+    prof.print("session constructior");
 
+    prof.start();
     onnxruntime::Graph& graph = model_->MainGraph();
+    prof.print("get graph");
 
+    prof.start();
     // Collect the kernel registries from execution provider instances;
     // There are 2 kinds of kernel registries with priority from high to low as below,
     // 1. Custom execution provider type specific kernel registries.
@@ -1065,7 +1119,9 @@ common::Status InferenceSession::Initialize() {
     //
     // Register 2nd registries into KernelRegistryManager.
     ORT_RETURN_IF_ERROR_SESSIONID_(kernel_registry_manager_.RegisterKernels(execution_providers_));
+    prof.print("register kernels");
 
+prof.start();
 #if !defined(ORT_MINIMAL_BUILD)
     // add predefined transformers
     AddPredefinedTransformers(graph_transformation_mgr_, session_options_.graph_optimization_level,
@@ -1083,19 +1139,25 @@ common::Status InferenceSession::Initialize() {
     // Update temporary copies of metadata, input- and output definitions to the same state as the resolved graph
     ORT_RETURN_IF_ERROR_SESSIONID_(SaveModelMetadata(*model_));
 #endif  // !defined(ORT_MINIMAL_BUILD)
+prof.print("!minimal build transforms");
 
+    prof.start();
     // need to keep the initializers if we're going to save the optimized model
     bool keep_initializers = !session_options_.optimized_model_filepath.empty();
 
     auto* serialized_session_state = !ort_format_model_bytes_.empty()
                                          ? fbs::GetInferenceSession(ort_format_model_bytes_.data())->session_state()
                                          : nullptr;
+    prof.print("GetInferenceSession");
 
+    prof.start();
     ORT_RETURN_IF_ERROR_SESSIONID_(session_state_->FinalizeSessionState(model_location_, kernel_registry_manager_,
                                                                         session_options_,
                                                                         serialized_session_state,
                                                                         !keep_initializers));
+    prof.print("finalize session state");
 
+    prof.start();
 #if !defined(ORT_MINIMAL_BUILD)
     if (!session_options_.optimized_model_filepath.empty()) {
       if (session_options_.graph_optimization_level >= TransformerLevel::Level3) {
@@ -1117,13 +1179,17 @@ common::Status InferenceSession::Initialize() {
       }
     }
 #endif  // !defined(ORT_MINIMAL_BUILD)
+    prof.print("optimized file load");
 
+    prof.start();
     session_state_->ResolveMemoryPatternFlag();
     is_inited_ = true;
+    prof.print("resolve memflag");
 
     // we don't directly use the ORT format bytes currently, so free those now
     std::vector<uint8_t>().swap(ort_format_model_bytes_);
 
+    prof.start();
     // and log telemetry
     bool model_has_fp16_inputs = ModelHasFP16Inputs(graph);
     env.GetTelemetryProvider().LogSessionCreation(
@@ -1131,6 +1197,7 @@ common::Status InferenceSession::Initialize() {
         model_->MainGraph().DomainToVersionMap(), model_->MainGraph().Name(), model_->MetaData(),
         telemetry_.event_name_, execution_providers_.GetIds(), model_has_fp16_inputs);
     LOGS(*session_logger_, INFO) << "Session successfully initialized.";
+    prof.print("telemetry");
   }
   ORT_CATCH(const NotImplementedException& ex) {
     ORT_HANDLE_EXCEPTION([&]() {
@@ -1162,6 +1229,7 @@ common::Status InferenceSession::Initialize() {
     }
   }
 
+  e2e.print("e2e");
   return status;
 }
 

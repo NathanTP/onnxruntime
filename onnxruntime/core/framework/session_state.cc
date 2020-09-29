@@ -18,6 +18,48 @@
 using namespace ::onnxruntime::common;
 using namespace ::onnxruntime::experimental;
 
+// NP XXX
+class timer {
+  public:
+    timer() {
+      name = "";
+    }
+
+    timer(const char *in_name) {
+      name = in_name;
+    }
+
+    void start() {
+      startTime = std::chrono::high_resolution_clock::now();
+    }
+
+    void stop() {
+      totalTime += (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+    }
+
+    void reset() {
+      totalTime = 0;
+    }
+
+    int64_t report(void) {
+      return totalTime;
+    }
+
+    void print(const char *extra = "") {
+      stop();
+      printf("%s:%s -> %jdus\n", name, extra, totalTime);
+      reset();
+    }
+   
+    private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
+
+    // Total time in microseconds
+    int64_t totalTime = 0;
+    const char *name;
+};
+
+
 namespace onnxruntime {
 
 void SessionState::SetupAllocators() {
@@ -778,16 +820,24 @@ Status SessionState::FinalizeSessionState(const std::basic_string<PATH_CHAR_TYPE
                                           const SessionOptions& session_options,
                                           const onnxruntime::experimental::fbs::SessionState* serialized_session_state,
                                           bool remove_initializers) {
+  timer prof = timer("FinalizeSessionState");
+
+  prof.start();
   // recursively create the subgraph session state instances and populate the kernel create info in them.
   // it's simpler to handle the kernel create info recursively when deserializing,
   // so also do it recursively when calling PopulateKernelCreateInfo for consistency.
   ORT_RETURN_IF_ERROR(CreateSubgraphSessionState());
+  prof.print("CreateSubgraphSessionState");
 
   if (serialized_session_state) {
+    prof.start();
     ORT_RETURN_IF_ERROR(LoadFromOrtFormat(*serialized_session_state, kernel_registry_manager));
+    prof.print("LoadFromOrtFormat");
   } else {
 #if !defined(ORT_MINIMAL_BUILD)
+    prof.start();
     ORT_RETURN_IF_ERROR(PopulateKernelCreateInfo(kernel_registry_manager));
+    prof.print("PopulateKernelCreateInfo");
 #else
     ORT_UNUSED_PARAMETER(graph_location);
     ORT_UNUSED_PARAMETER(kernel_registry_manager);
@@ -798,8 +848,11 @@ Status SessionState::FinalizeSessionState(const std::basic_string<PATH_CHAR_TYPE
 #endif
   }
 
-  return FinalizeSessionStateImpl(graph_location, kernel_registry_manager, nullptr, session_options,
+  prof.start();
+  auto ret = FinalizeSessionStateImpl(graph_location, kernel_registry_manager, nullptr, session_options,
                                   remove_initializers);
+  prof.print("FinalizeSessionStateImpl");
+  return ret;
 }
 
 Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_TYPE>& graph_location,
@@ -807,6 +860,7 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
                                               _In_opt_ const Node* parent_node,
                                               const SessionOptions& session_options,
                                               bool remove_initializers) {
+  timer prof = timer("FinalizeSessionstateImpl");
   CreateGraphInfo();
 
   // ignore any outer scope args we don't know about. this can happen if a node contains multiple subgraphs.
@@ -824,10 +878,12 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
                   });
   }
 
+  prof.start();
   SequentialPlannerContext context(session_options.execution_mode);
   ORT_RETURN_IF_ERROR(SequentialPlanner::CreatePlan(parent_node, *graph_viewer_, valid_outer_scope_node_args,
                                                     execution_providers_, kernel_create_info_map_,
                                                     ort_value_name_idx_map_, context, p_seq_exec_plan_));
+  prof.print("CreatePlan");
 
   // Uncomment the below to dump the allocation plan to std::cout
   // LOGS(logger_, VERBOSE) << std::make_pair(p_seq_exec_plan_.get(), this);
@@ -835,6 +891,7 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   std::unique_ptr<ITensorAllocator> tensor_allocator_(
       ITensorAllocator::Create(enable_mem_pattern_, *p_seq_exec_plan_, *this, weights_buffers_));
 
+  prof.start();
   // move initializers from TensorProto instances in Graph to OrtValue instances in SessionState
   ORT_RETURN_IF_ERROR(
       session_state_utils::SaveInitializedTensors(
@@ -852,8 +909,11 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   if (remove_initializers) {
     CleanInitializedTensorsFromGraph();
   }
+  prof.print("SaveInitializedTensors");
 
+  prof.start();
   ORT_RETURN_IF_ERROR(CreateKernels(kernel_registry_manager));
+  prof.print("CreateKernels");
 
   const auto disable_prepacking =
       session_options.GetConfigOrDefault(kOrtSessionOptionsConfigDisablePrepacking, "0");
@@ -872,6 +932,7 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   SessionOptions subgraph_session_options(session_options);
   subgraph_session_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
 
+  prof.start();
   for (const auto& node_to_subgraph_ss : subgraph_session_states_) {
     Node& node = *graph_.GetNode(node_to_subgraph_ss.first);
 
@@ -899,6 +960,7 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
       ORT_RETURN_IF_ERROR(control_flow_kernel.SetupSubgraphExecutionInfo(*this, attr_name, subgraph_session_state));
     }
   }
+  prof.print("subgraph recurse");
 
   return Status::OK();
 }
